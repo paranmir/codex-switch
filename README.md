@@ -1,0 +1,176 @@
+# Codex Switch
+
+A small Windows CLI for saving multiple Codex logins as named profiles and switching between them.
+
+> [!IMPORTANT]
+> This is an unofficial community utility, not an OpenAI product. It works by replacing Codex's local `auth.json`; future Codex updates may change this behavior.
+
+## Features
+
+- Add accounts through the normal `codex login` browser flow
+- Save, list, rename, remove, and switch named profiles
+- Automatically preserve the current login before adding another account
+- Keep credentials outside the Git repository in a user-local data directory
+- Support custom `CODEX_HOME` and `CODEX_SWITCH_HOME` locations
+- Diagnose the Codex installation, paths, and login state
+
+## Requirements
+
+- Windows 10 or 11
+- [Codex CLI](https://developers.openai.com/codex/) available as the `codex` command
+- PowerShell 7 recommended; Windows PowerShell 5.1 is used as a fallback
+
+## Install
+
+Clone the repository or download and extract its ZIP:
+
+```powershell
+git clone <YOUR-REPOSITORY-URL> codex-switch
+cd codex-switch
+.\codexSwitch.cmd doctor
+```
+
+No administrator rights or installer are required. Add the repository directory to your user `PATH` if you want to call `codexSwitch` from anywhere.
+
+## Quick start
+
+Save your existing Codex login:
+
+```powershell
+.\codexSwitch.cmd save work
+```
+
+Add another account. A browser login will open; you do not need to locate or copy any configuration file yourself:
+
+```powershell
+.\codexSwitch.cmd add personal
+```
+
+Switch whenever needed:
+
+```powershell
+.\codexSwitch.cmd switch work
+.\codexSwitch.cmd switch personal
+```
+
+Run without arguments for an interactive menu:
+
+```powershell
+.\codexSwitch.cmd
+```
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `whoami` | Show the active profile, email, and auth method |
+| `list` | List saved profiles |
+| `save <name>` | Save the current Codex login |
+| `add <name>` | Preserve the current login, sign in, and save a new account |
+| `switch <name>` | Switch to a saved account |
+| `rename <old> <new>` | Rename a profile |
+| `remove <name>` | Permanently delete a profile |
+| `files` | Open the profile data directory |
+| `doctor` | Check Codex, login status, and actual paths |
+| `help` | Show command-line help |
+
+Names must be 1–40 characters, start with a letter or number, and contain only letters, numbers, `.`, `_`, or `-`.
+
+## How `add` works
+
+`codexSwitch add personal`:
+
+1. Saves the active profile's latest authentication state.
+2. If the existing login has no profile name, preserves it as `previous-YYYYMMDD-HHMMSS`.
+3. Runs `codex logout` and `codex login`.
+4. Saves the newly created Codex auth file as `personal`.
+
+You normally never need to handle `auth.json` manually.
+
+## Finding Codex configuration files
+
+The default Codex home on Windows is:
+
+```text
+%USERPROFILE%\.codex
+```
+
+Typical files:
+
+- Configuration: `%USERPROFILE%\.codex\config.toml`
+- Login credentials: `%USERPROFILE%\.codex\auth.json`
+
+Check the effective paths without displaying credential contents:
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$codexHome
+Test-Path (Join-Path $codexHome 'config.toml')
+Test-Path (Join-Path $codexHome 'auth.json')
+```
+
+Or use:
+
+```powershell
+.\codexSwitch.cmd doctor
+```
+
+When `CODEX_HOME` is set, Codex Switch uses that directory instead of the default `.codex` directory.
+
+## Profile storage
+
+Profiles are deliberately stored outside the repository:
+
+```text
+%LOCALAPPDATA%\CodexSwitch\
+├── profiles.json
+└── profiles\
+    ├── work.auth.json
+    └── personal.auth.json
+```
+
+Override the location when needed:
+
+```powershell
+$env:CODEX_SWITCH_HOME = 'D:\Secure\CodexSwitch'
+.\codexSwitch.cmd list
+```
+
+Older repository-local `profiles.json` and `profiles/` data are copied to the new location on first run. After verifying the migration, remove the old copies securely.
+
+## Security
+
+- `auth.json` and `*.auth.json` contain sensitive account tokens.
+- Never paste their contents into terminals, issues, chats, email, or GitHub.
+- Do not sync `%LOCALAPPDATA%\CodexSwitch` to cloud storage or place it in a public repository.
+- On Windows, the tool attempts to restrict its data directory to the current user and SYSTEM.
+- `remove` deletes a profile permanently without using the Recycle Bin.
+- On shared computers, separate Windows user accounts are safer than shared profile files.
+- Follow your organization's security policy; do not use this tool if credential-file copying is prohibited.
+
+## Troubleshooting
+
+```powershell
+.\codexSwitch.cmd doctor
+codex login status
+```
+
+- **`codex` not found:** install Codex CLI and open a new terminal.
+- **Switch not reflected:** fully restart Codex Desktop and existing CLI sessions.
+- **Login interrupted:** run `add` again, or complete `codex login` and then run `save <name>`.
+- **Windows PowerShell shows garbled text:** install PowerShell 7 so `pwsh` is available.
+
+## Before publishing or contributing
+
+The credential paths are ignored, but always verify before committing:
+
+```powershell
+git status --short
+git ls-files | Select-String -Pattern 'auth\.json|profiles\.json'
+```
+
+The second command must produce no output. Never use `git add -f` on profile or auth files.
+
+## License
+
+[MIT](LICENSE)

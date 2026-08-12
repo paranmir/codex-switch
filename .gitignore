@@ -1,0 +1,5 @@
+profiles/
+profiles.json
+*.tmp
+.DS_Store
+Thumbs.db

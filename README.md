@@ -25,7 +25,7 @@ A small Windows CLI for saving multiple Codex logins as named profiles and switc
 Clone the repository or download and extract its ZIP:
 
 ```powershell
-git clone <YOUR-REPOSITORY-URL> codex-switch
+git clone https://github.com/paranmir/codex-switch.git
 cd codex-switch
 .\codexSwitch.cmd doctor
 ```

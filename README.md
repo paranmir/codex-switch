@@ -49,6 +49,7 @@ Add another account. A browser login will open; you do not need to locate or cop
 Switch whenever needed:
 
 ```powershell
+# First exit Codex Desktop completely, including its tray/background process.
 .\codexSwitch.cmd switch work
 .\codexSwitch.cmd switch personal
 ```
@@ -57,6 +58,12 @@ Run without arguments for an interactive menu:
 
 ```powershell
 .\codexSwitch.cmd
+```
+
+Choose **7. Register the currently signed-in account** to save the account that Codex Desktop is using right now. This does not close Codex or start another browser login. The equivalent command is:
+
+```powershell
+.\codexSwitch.cmd save <name>
 ```
 
 ## Commands
@@ -70,6 +77,7 @@ Run without arguments for an interactive menu:
 | `switch <name>` | Switch to a saved account |
 | `rename <old> <new>` | Rename a profile |
 | `remove <name>` | Permanently delete a profile |
+| `delete <name>` | Alias for `remove` |
 | `files` | Open the profile data directory |
 | `doctor` | Check Codex, login status, and actual paths |
 | `help` | Show command-line help |
@@ -80,8 +88,8 @@ Names must be 1–40 characters, start with a letter or number, and contain only
 
 `codexSwitch add personal`:
 
-1. Saves the active profile's latest authentication state.
-2. If the existing login has no profile name, preserves it as `previous-YYYYMMDD-HHMMSS`.
+1. Finds an existing profile for the current account and refreshes that profile instead of creating another recovery copy.
+2. If the existing login has no matching profile, preserves it once as `previous-YYYYMMDD-HHMMSS` or `recovered-YYYYMMDD-HHMMSS`.
 3. Runs `codex logout` and `codex login`.
 4. Saves the newly created Codex auth file as `personal`.
 
@@ -156,7 +164,9 @@ codex login status
 ```
 
 - **`codex` not found:** install Codex CLI and open a new terminal.
-- **Switch not reflected:** fully restart Codex Desktop and existing CLI sessions.
+- **Switch not reflected:** exit Codex Desktop completely (including its tray/background process), run `switch` again, and then reopen the app. Codex Switch refuses to replace authentication while the desktop app is running because the app can restore its previous login during shutdown.
+- **Profiles show the same account:** run `doctor`. It reports profiles that contain the same account and detects when the current login differs from the recorded active profile. Re-add any profile that was already overwritten; lost credentials cannot be reconstructed from the duplicate file.
+- **A profile file was deleted manually:** the next `list`, menu refresh, or other command removes the missing entry from `profiles.json`. The interactive menu also provides **Delete a profile** so manual file deletion is normally unnecessary.
 - **Login interrupted:** run `add` again, or complete `codex login` and then run `save <name>`.
 - **Windows PowerShell shows garbled text:** install PowerShell 7 so `pwsh` is available.
 

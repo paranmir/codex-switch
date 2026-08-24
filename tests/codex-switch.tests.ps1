@@ -71,11 +71,15 @@ try {
     # even when the registry's active name is stale. It must not create recovered-*.
     $fakeBin = Join-Path $testRoot 'fake-bin'
     $fakeLoginAuth = Join-Path $testRoot 'next-login.auth.json'
+    $fakeCallLog = Join-Path $testRoot 'codex-calls.log'
     New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
     [IO.File]::WriteAllText($fakeLoginAuth, (New-TestAuth 'account-c' 'c@example.test'), [Text.UTF8Encoding]::new($false))
     $fakeCodex = @'
-param([Parameter(Position = 0)][string]$Action, [Parameter(Position = 1)][string]$Subaction)
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$AllArgs)
+$Action = $AllArgs | Select-Object -First 1
+$Subaction = $AllArgs | Select-Object -Skip 1 -First 1
 $authPath = Join-Path $env:CODEX_HOME 'auth.json'
+Add-Content -LiteralPath $env:CODEX_TEST_CALL_LOG -Value ($AllArgs -join ' ')
 if ($Action -eq 'logout') {
     if (Test-Path -LiteralPath $authPath) { Remove-Item -LiteralPath $authPath }
     exit 0
@@ -87,10 +91,21 @@ if ($Action -eq 'login') {
 }
 exit 1
 '@
-    [IO.File]::WriteAllText((Join-Path $fakeBin 'codex.ps1'), $fakeCodex, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $fakeBin 'fake-codex.ps1'), $fakeCodex, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(
+        (Join-Path $fakeBin 'codex.cmd'),
+        "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"%~dp0fake-codex.ps1`" %*`r`nexit /b %errorlevel%`r`n",
+        [Text.UTF8Encoding]::new($false)
+    )
     $env:CODEX_TEST_LOGIN_AUTH = $fakeLoginAuth
+    $env:CODEX_TEST_CALL_LOG = $fakeCallLog
     $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $env:PATH
     & $scriptPath add gamma *> $null
+    $codexCalls = @(Get-Content -LiteralPath $fakeCallLog)
+    Assert-True (-not ($codexCalls -match '^logout(?:\s|$)')) 'add must not call codex logout and invalidate the profile it just saved'
+    Assert-True ([bool]($codexCalls -match '^login(?:\s|$)')) 'add should start a new Codex login'
+    $config = Get-Content -Raw -LiteralPath (Join-Path $env:CODEX_HOME 'config.toml')
+    Assert-True ($config -match '(?m)^cli_auth_credentials_store\s*=\s*"file"') 'add should enforce file-based credential storage'
     $registry = Get-Content -Raw -LiteralPath (Join-Path $env:CODEX_SWITCH_HOME 'profiles.json') | ConvertFrom-Json
     $recoveredNames = @($registry.profiles.PSObject.Properties | ForEach-Object { $_.Name } | Where-Object { $_ -like 'recovered-*' })
     Assert-True ($recoveredNames.Count -eq 0) 'add should reuse a matching profile instead of creating recovered-*'
@@ -113,6 +128,7 @@ exit 1
     $env:OS = $originalOS
     $env:CODEX_SWITCH_TEST_SKIP_APP_CHECK = $originalSkipAppCheck
     $env:CODEX_TEST_LOGIN_AUTH = $null
+    $env:CODEX_TEST_CALL_LOG = $null
     $env:CODEX_HOME = $null
     $env:CODEX_SWITCH_HOME = $null
     $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)

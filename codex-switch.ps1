@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('menu','whoami','list','add','save','switch','rename','remove','delete','files','doctor','help')]
+    [ValidateSet('menu','whoami','list','add','save','switch','rename','remove','delete','files','setup','doctor','help')]
     [string]$Command = 'menu',
     [Parameter(Position = 1)]
     [string]$Name,
@@ -24,9 +24,59 @@ $ProfilesDir = Join-Path $DataRoot 'profiles'
 $RegistryPath = Join-Path $DataRoot 'profiles.json'
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $AuthPath = Join-Path $CodexHome 'auth.json'
+$ConfigPath = Join-Path $CodexHome 'config.toml'
 
 function Write-Utf8NoBom([string]$Path, [string]$Value) {
     [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
+}
+
+function Get-CredentialStoreMode {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $null }
+    $config = Get-Content -Raw -LiteralPath $ConfigPath
+    $match = [regex]::Match(
+        $config,
+        '(?im)^\s*cli_auth_credentials_store\s*=\s*["''](file|keyring|auto)["'']\s*(?:#.*)?$'
+    )
+    if ($match.Success) { return $match.Groups[1].Value.ToLowerInvariant() }
+    return $null
+}
+
+function Ensure-FileCredentialStore {
+    Assert-CodexDesktopStopped
+    $currentMode = Get-CredentialStoreMode
+    if ($currentMode -eq 'file') { return }
+
+    New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
+    $original = if (Test-Path -LiteralPath $ConfigPath) {
+        Get-Content -Raw -LiteralPath $ConfigPath
+    } else {
+        ''
+    }
+
+    if ($original) {
+        $backupPath = "$ConfigPath.codex-switch.bak"
+        if (-not (Test-Path -LiteralPath $backupPath)) {
+            Copy-Item -LiteralPath $ConfigPath -Destination $backupPath
+        }
+    }
+
+    $settingPattern = '(?im)^\s*cli_auth_credentials_store\s*=\s*["''](?:file|keyring|auto)["'']\s*(?:#.*)?$'
+    if ([regex]::IsMatch($original, $settingPattern)) {
+        $updated = [regex]::new($settingPattern).Replace(
+            $original,
+            'cli_auth_credentials_store = "file"',
+            1
+        )
+    } else {
+        $separator = if ($original -and -not $original.StartsWith("`r") -and -not $original.StartsWith("`n")) { "`r`n`r`n" } else { '' }
+        $updated = "cli_auth_credentials_store = `"file`"$separator$original"
+    }
+
+    $temp = "$ConfigPath.codex-switch.tmp"
+    Write-Utf8NoBom $temp $updated
+    Move-Item -Force -LiteralPath $temp -Destination $ConfigPath
+    Write-Host 'Configured Codex to use file-based credentials for reliable profile switching.' -ForegroundColor Green
+    if ($original) { Write-Host "Config backup: $ConfigPath.codex-switch.bak" -ForegroundColor DarkGray }
 }
 
 function Initialize-Store {
@@ -199,6 +249,7 @@ function Wait-CodexDesktopStopped {
 
 function Save-Current([string]$ProfileName, [switch]$SetActive) {
     Assert-ProfileName $ProfileName
+    Ensure-FileCredentialStore
     if (-not (Test-Path -LiteralPath $AuthPath)) { throw "Codex auth file not found: $AuthPath" }
     $registry = Read-Registry
     $destination = Get-ProfilePath $ProfileName
@@ -273,6 +324,7 @@ function Show-List {
 function Switch-Profile([string]$ProfileName) {
     Assert-ProfileName $ProfileName
     Assert-CodexDesktopStopped
+    Ensure-FileCredentialStore
     $registry = Read-Registry
     $property = $registry.profiles.PSObject.Properties[$ProfileName]
     if (-not $property) { throw "Profile not found: $ProfileName" }
@@ -302,6 +354,7 @@ function Switch-Profile([string]$ProfileName) {
 function Add-Account([string]$ProfileName) {
     Assert-ProfileName $ProfileName
     Assert-CodexDesktopStopped
+    Ensure-FileCredentialStore
     $registry = Read-Registry
     if (Test-Path -LiteralPath $AuthPath) {
         $matchingName = Get-MatchingProfileName $AuthPath $registry
@@ -315,11 +368,29 @@ function Add-Account([string]$ProfileName) {
             Write-Host "The current login was preserved once as: $backupName" -ForegroundColor Yellow
         }
     }
-    Write-Host 'Sign in to the Codex account you want to add in the browser.' -ForegroundColor Cyan
-    & codex logout
-    & codex login
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $AuthPath)) { throw 'Codex login did not complete.' }
-    Save-Current $ProfileName -SetActive
+    $pendingAuth = $null
+    if (Test-Path -LiteralPath $AuthPath) {
+        $pendingAuth = Join-Path $DataRoot ("auth-before-add-{0}.json" -f [guid]::NewGuid().ToString('N'))
+        Move-Item -LiteralPath $AuthPath -Destination $pendingAuth
+    }
+
+    try {
+        Write-Host 'Sign in to the Codex account you want to add in the browser.' -ForegroundColor Cyan
+        Write-Host 'The previous local login was set aside without calling codex logout.' -ForegroundColor DarkGray
+        & codex login -c 'cli_auth_credentials_store="file"'
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $AuthPath)) { throw 'Codex login did not complete.' }
+        Save-Current $ProfileName -SetActive
+        if ($pendingAuth -and (Test-Path -LiteralPath $pendingAuth)) {
+            Remove-Item -LiteralPath $pendingAuth
+        }
+    } catch {
+        if (Test-Path -LiteralPath $AuthPath) { Remove-Item -LiteralPath $AuthPath }
+        if ($pendingAuth -and (Test-Path -LiteralPath $pendingAuth)) {
+            Move-Item -LiteralPath $pendingAuth -Destination $AuthPath
+            Write-Warning 'The new login failed, so the previous Codex login was restored.'
+        }
+        throw
+    }
 }
 
 function Rename-Profile([string]$Old, [string]$New) {
@@ -361,6 +432,7 @@ Codex Switch
   codexSwitch remove <name>          Delete a saved profile
   codexSwitch delete <name>          Alias for remove
   codexSwitch files                  Open the profile data directory
+  codexSwitch setup                  Configure reliable file-based auth storage
   codexSwitch doctor                 Check installation, paths, and login
   codexSwitch                        Interactive menu
 '@ | Write-Host
@@ -371,11 +443,16 @@ function Show-Doctor {
     Write-Host "Codex executable: $(if ($codex) { $codex.Source } else { 'NOT FOUND' })"
     Write-Host "CODEX_HOME:       $CodexHome"
     Write-Host "Auth file:        $AuthPath ($(if (Test-Path -LiteralPath $AuthPath) { 'found' } else { 'not found' }))"
+    $credentialMode = Get-CredentialStoreMode
+    Write-Host "Credential store: $(if ($credentialMode) { $credentialMode } else { 'default/unspecified' })"
     Write-Host "Profile data:     $DataRoot"
     Write-Host "Registry:         $RegistryPath"
     $desktopProcesses = @(Get-CodexDesktopProcesses)
     Write-Host "Codex Desktop:    $(if ($desktopProcesses.Count) { 'RUNNING - exit completely before add/switch' } else { 'not running' })"
     $registry = Read-Registry
+    if ($credentialMode -ne 'file') {
+        Write-Warning 'Reliable switching requires file-based credentials. Exit Codex Desktop and run: codexSwitch setup'
+    }
     if ($registry.active -and (Test-Path -LiteralPath $AuthPath)) {
         $activePath = Get-ProfilePath ([string]$registry.active)
         if (-not (Test-Path -LiteralPath $activePath)) {
@@ -428,7 +505,7 @@ function Start-Menu {
                         Write-Host 'Canceled.' -ForegroundColor Yellow
                     }
                 }
-                '7' { Register-CurrentInteractive }
+                '7' { if (Wait-CodexDesktopStopped) { Register-CurrentInteractive } }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
             }
@@ -451,6 +528,7 @@ try {
         'remove' { Remove-Profile $Name }
         'delete' { Remove-Profile $Name }
         'files'  { Start-Process explorer.exe $ProfilesDir; Write-Host $ProfilesDir }
+        'setup'  { Ensure-FileCredentialStore }
         'doctor' { Show-Doctor }
         'help'   { Show-Help }
     }

@@ -10,6 +10,8 @@ A small Windows CLI for saving multiple Codex logins as named profiles and switc
 - Add accounts through the normal `codex login` browser flow
 - Save, list, rename, remove, and switch named profiles
 - Automatically preserve the current login before adding another account
+- Configure Codex to use file-based credentials so Desktop and CLI read the switched profile
+- Add accounts without calling `codex logout`, which could invalidate the profile just saved
 - Keep credentials outside the Git repository in a user-local data directory
 - Support custom `CODEX_HOME` and `CODEX_SWITCH_HOME` locations
 - Diagnose the Codex installation, paths, and login state
@@ -28,6 +30,7 @@ Clone the repository or download and extract its ZIP:
 git clone https://github.com/paranmir/codex-switch.git
 cd codex-switch
 .\codexSwitch.cmd doctor
+.\codexSwitch.cmd setup
 ```
 
 No administrator rights or installer are required. Add the repository directory to your user `PATH` if you want to call `codexSwitch` from anywhere.
@@ -60,7 +63,7 @@ Run without arguments for an interactive menu:
 .\codexSwitch.cmd
 ```
 
-Choose **7. Register the currently signed-in account** to save the account that Codex Desktop is using right now. This does not close Codex or start another browser login. The equivalent command is:
+After exiting Codex Desktop, choose **7. Register the currently signed-in account** to save its last active account without starting another browser login. The equivalent command is:
 
 ```powershell
 .\codexSwitch.cmd save <name>
@@ -79,6 +82,7 @@ Choose **7. Register the currently signed-in account** to save the account that 
 | `remove <name>` | Permanently delete a profile |
 | `delete <name>` | Alias for `remove` |
 | `files` | Open the profile data directory |
+| `setup` | Configure Codex to use file-based credential storage |
 | `doctor` | Check Codex, login status, and actual paths |
 | `help` | Show command-line help |
 
@@ -90,8 +94,9 @@ Names must be 1–40 characters, start with a letter or number, and contain only
 
 1. Finds an existing profile for the current account and refreshes that profile instead of creating another recovery copy.
 2. If the existing login has no matching profile, preserves it once as `previous-YYYYMMDD-HHMMSS` or `recovered-YYYYMMDD-HHMMSS`.
-3. Runs `codex logout` and `codex login`.
-4. Saves the newly created Codex auth file as `personal`.
+3. Temporarily moves the current local `auth.json` aside without calling `codex logout`.
+4. Runs `codex login` with file-based credential storage enabled.
+5. Saves the newly created Codex auth file as `personal`. If login fails, the previous login is restored.
 
 You normally never need to handle `auth.json` manually.
 
@@ -124,6 +129,14 @@ Or use:
 ```
 
 When `CODEX_HOME` is set, Codex Switch uses that directory instead of the default `.codex` directory.
+
+Modern Codex can keep credentials either in `auth.json` or in the operating-system keyring. Codex Switch manages files, so `setup`, `add`, and `switch` explicitly set this user-level option in `config.toml`:
+
+```toml
+cli_auth_credentials_store = "file"
+```
+
+If a configuration file already exists, its original contents are backed up once as `config.toml.codex-switch.bak`. See the [official Codex authentication documentation](https://learn.chatgpt.com/docs/auth#credential-storage) for the supported credential stores.
 
 ## Profile storage
 
@@ -165,6 +178,7 @@ codex login status
 
 - **`codex` not found:** install Codex CLI and open a new terminal.
 - **Switch not reflected:** exit Codex Desktop completely (including its tray/background process), run `switch` again, and then reopen the app. Codex Switch refuses to replace authentication while the desktop app is running because the app can restore its previous login during shutdown.
+- **Codex asks you to sign in after switching:** update Codex Switch, close Codex Desktop, and run `codexSwitch setup`. Profiles created by an older release may have been invalidated by its `codex logout` step; re-add that account once with `codexSwitch add <name>`, then switch again.
 - **Profiles show the same account:** run `doctor`. It reports profiles that contain the same account and detects when the current login differs from the recorded active profile. Re-add any profile that was already overwritten; lost credentials cannot be reconstructed from the duplicate file.
 - **A profile file was deleted manually:** the next `list`, menu refresh, or other command removes the missing entry from `profiles.json`. The interactive menu also provides **Delete a profile** so manual file deletion is normally unnecessary.
 - **Login interrupted:** run `add` again, or complete `codex login` and then run `save <name>`.

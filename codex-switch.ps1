@@ -25,24 +25,29 @@ $RegistryPath = Join-Path $DataRoot 'profiles.json'
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $AuthPath = Join-Path $CodexHome 'auth.json'
 $ConfigPath = Join-Path $CodexHome 'config.toml'
+. (Join-Path $ScriptRoot 'auth-check.ps1')
 
 function Write-Utf8NoBom([string]$Path, [string]$Value) {
     [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
 }
 
-function Get-CredentialStoreMode {
+function Get-CredentialStoreSetting {
     if (-not (Test-Path -LiteralPath $ConfigPath)) { return $null }
     $config = Get-Content -Raw -LiteralPath $ConfigPath
-    $match = [regex]::Match(
-        $config,
-        '(?im)^\s*cli_auth_credentials_store\s*=\s*["''](file|keyring|auto)["'']\s*(?:#.*)?$'
-    )
+    # Only a root setting applies globally; table-local settings must not hide it.
+    $rootConfig = [regex]::new('(?m)^[\t ]*\[').Split($config, 2)[0]
+    return [regex]::Match($rootConfig, '(?im)^[\t ]*cli_auth_credentials_store[\t ]*=[\t ]*["''](file|keyring|auto|ephemeral)["''][\t ]*(?:#[^\r\n]*)?\r?$')
+}
+
+function Get-CredentialStoreMode {
+    $match = Get-CredentialStoreSetting
+    if (-not $match) { return $null }
     if ($match.Success) { return $match.Groups[1].Value.ToLowerInvariant() }
     return $null
 }
 
 function Ensure-FileCredentialStore {
-    Assert-CodexDesktopStopped
+    Assert-CodexClientsStopped
     $currentMode = Get-CredentialStoreMode
     if ($currentMode -eq 'file') { return }
 
@@ -60,13 +65,11 @@ function Ensure-FileCredentialStore {
         }
     }
 
-    $settingPattern = '(?im)^\s*cli_auth_credentials_store\s*=\s*["''](?:file|keyring|auto)["'']\s*(?:#.*)?$'
-    if ([regex]::IsMatch($original, $settingPattern)) {
-        $updated = [regex]::new($settingPattern).Replace(
-            $original,
-            'cli_auth_credentials_store = "file"',
-            1
-        )
+    $setting = Get-CredentialStoreSetting
+    if ($setting -and $setting.Success) {
+        $lineEnding = if ($setting.Value.EndsWith("`r")) { "`r" } else { '' }
+        $updated = $original.Remove($setting.Index, $setting.Length).Insert(
+            $setting.Index, 'cli_auth_credentials_store = "file"' + $lineEnding)
     } else {
         $separator = if ($original -and -not $original.StartsWith("`r") -and -not $original.StartsWith("`n")) { "`r`n`r`n" } else { '' }
         $updated = "cli_auth_credentials_store = `"file`"$separator$original"
@@ -214,37 +217,62 @@ function Get-MatchingProfileName([string]$Path, [object]$Registry) {
     return $matches | Select-Object -First 1
 }
 
-function Get-CodexDesktopProcesses {
+function Get-CodexClientProcesses {
     if ($env:CODEX_SWITCH_TEST_SKIP_APP_CHECK -eq '1') { return @() }
-    $processes = @(Get-Process -Name 'Codex','ChatGPT' -ErrorAction SilentlyContinue)
-    return @($processes | Where-Object {
-        $path = try { $_.Path } catch { '' }
-        if (-not $path) { return ($_.MainWindowHandle -ne 0) }
-        $isPackagedApp = $path -match '[\\/]WindowsApps[\\/]OpenAI\.(Codex|ChatGPT)_'
-        $isBundledCli = $path -match '[\\/]resources[\\/]codex(?:\.exe)?$'
-        return ($isPackagedApp -and -not $isBundledCli)
-    })
+    $processes = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate -ErrorAction Stop)
+    $byId = @{}
+    foreach ($process in $processes) { $byId[[int]$process.ProcessId] = $process }
+    foreach ($process in $processes) {
+        $path = [string]$process.ExecutablePath
+        $isDesktop = $process.Name -ieq 'ChatGPT.exe' -and
+            (-not $path -or $path -match '[\\/]WindowsApps[\\/]OpenAI\.(Codex|ChatGPT)_')
+        if ($process.Name -ine 'codex.exe' -and -not $isDesktop) { continue }
+        $parent = $byId[[int]$process.ParentProcessId]
+        # An exited parent's PID may have been reused by an unrelated process.
+        $parentName = if ($parent -and $parent.CreationDate -and $process.CreationDate -and
+            $parent.CreationDate -le $process.CreationDate) { [string]$parent.Name } else { '' }
+        [pscustomobject]@{
+            Id = [int]$process.ProcessId
+            ProcessName = [string]$process.Name
+            Path = $path
+            ParentId = [int]$process.ParentProcessId
+            ParentName = $parentName
+        }
+    }
 }
 
-function Assert-CodexDesktopStopped {
-    $running = @(Get-CodexDesktopProcesses)
+function Get-CodexClientDescription([object]$Client) {
+    $description = "$($Client.ProcessName) (PID: $($Client.Id))"
+    if ($Client.ParentName) {
+        $description += "; parent: $($Client.ParentName) (PID: $($Client.ParentId))"
+    } elseif ($Client.ParentId) {
+        $description += "; parent PID: $($Client.ParentId) (exited or unavailable)"
+    }
+    if ($Client.Path) { $description += " - $($Client.Path)" }
+    return $description
+}
+
+function Assert-CodexClientsStopped {
+    $running = @(Get-CodexClientProcesses)
     if ($running.Count -eq 0) { return }
-    $ids = ($running.Id | Sort-Object -Unique) -join ', '
-    throw "Codex Desktop is still running (PID: $ids). Exit it completely, including any background/tray process, then run the command again. Switching while the app is running can restore the old login and overwrite a saved profile."
+    $details = ($running | Sort-Object Id | ForEach-Object { Get-CodexClientDescription $_ }) -join "`n  "
+    throw "Codex clients are still running:`n  $details`nClose the listed apps or their Codex extension completely, then retry. Existing processes can keep the old login and write it back to auth.json."
 }
 
-function Wait-CodexDesktopStopped {
-    while (@(Get-CodexDesktopProcesses).Count -gt 0) {
+function Wait-CodexClientsStopped {
+    while ($true) {
+        $running = @(Get-CodexClientProcesses)
+        if ($running.Count -eq 0) { return $true }
         Write-Host ''
-        Write-Host 'Codex Desktop is still running.' -ForegroundColor Yellow
-        Write-Host 'Exit Codex completely, including the tray/background process.'
+        Write-Host 'Codex clients are still running.' -ForegroundColor Yellow
+        foreach ($client in $running) { Write-Host "  $(Get-CodexClientDescription $client)" }
+        Write-Host 'Close the listed apps or their Codex extension completely.'
         $answer = Read-Host 'After closing it, press Enter to retry (or type C to cancel)'
         if ($answer -match '^[Cc]$') {
             Write-Host 'Canceled.' -ForegroundColor Yellow
             return $false
         }
     }
-    return $true
 }
 
 function Save-Current([string]$ProfileName, [switch]$SetActive) {
@@ -294,14 +322,13 @@ function Show-WhoAmI {
     $registry = Read-Registry
     $summary = Get-AuthSummary $AuthPath
     if (-not $summary) { Write-Host 'Codex is not currently logged in.' -ForegroundColor Yellow; return }
-    $active = '(not assigned)'
+    $matchingName = Get-MatchingProfileName $AuthPath $registry
+    $active = if ($matchingName) { $matchingName } else { '(not assigned)' }
     if ($registry.active) {
         $candidate = [string]$registry.active
         $profilePath = Get-ProfilePath $candidate
-        if ((Test-Path -LiteralPath $profilePath) -and (Test-SameAuthIdentity $AuthPath $profilePath)) {
-            $active = $candidate
-        } else {
-            $active = '(current login differs from saved active profile)'
+        if (-not ((Test-Path -LiteralPath $profilePath) -and (Test-SameAuthIdentity $AuthPath $profilePath))) {
+            Write-Warning "The current login differs from saved active profile '$candidate'. Showing the account in auth.json."
         }
     }
     Write-Host "Profile: $active"
@@ -314,32 +341,55 @@ function Show-List {
     $registry = Read-Registry
     $names = @($registry.profiles.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
     if ($names.Count -eq 0) { Write-Host 'No saved profiles.'; return }
+    $matchingName = Get-MatchingProfileName $AuthPath $registry
     foreach ($profileName in $names) {
         $entry = $registry.profiles.$profileName
-        $mark = if ($registry.active -eq $profileName) { '*' } else { ' ' }
+        $mark = if ($matchingName -eq $profileName) { '*' } else { ' ' }
         Write-Host "$mark $profileName`t$($entry.email)"
     }
+    Write-Host '* = current auth file; already-running sessions may still use an earlier login.' -ForegroundColor DarkGray
 }
 
 function Switch-Profile([string]$ProfileName) {
     Assert-ProfileName $ProfileName
-    Assert-CodexDesktopStopped
+    Assert-CodexClientsStopped
     Ensure-FileCredentialStore
     $registry = Read-Registry
     $property = $registry.profiles.PSObject.Properties[$ProfileName]
     if (-not $property) { throw "Profile not found: $ProfileName" }
-    if ($registry.active -and (Test-Path -LiteralPath $AuthPath)) {
+    if (Test-Path -LiteralPath $AuthPath) {
         $activeName = [string]$registry.active
-        $activePath = Get-ProfilePath $activeName
-        if ((Test-Path -LiteralPath $activePath) -and (Test-SameAuthIdentity $AuthPath $activePath)) {
-            Save-Current $activeName
-        } else {
+        $matchingName = Get-MatchingProfileName $AuthPath $registry
+        if ($activeName -and $matchingName -ne $activeName) {
             Write-Warning "The current Codex login does not match the saved active profile '$activeName'. It was not written over that profile."
+        }
+        if ($matchingName) {
+            # Preserve refreshed tokens even when the recorded active name is stale.
+            Save-Current $matchingName
+        } else {
+            $backupName = 'recovered-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Save-Current $backupName
+            Write-Host "The current login was preserved as: $backupName" -ForegroundColor Yellow
         }
         $registry = Read-Registry
     }
     $source = Get-ProfilePath $ProfileName
     if (-not (Test-Path -LiteralPath $source)) { throw "Profile file not found: $source" }
+    Write-Host "Checking saved login: $ProfileName" -ForegroundColor Cyan
+    $currentHash = if (Test-Path -LiteralPath $AuthPath) { (Get-FileHash -LiteralPath $AuthPath -Algorithm SHA256).Hash } else { '' }
+    try {
+        Confirm-CodexProfileAuth $source
+    } finally {
+        # A same-account refresh can rotate tokens before a later network check
+        # fails. Keep that account's current file in sync without switching users.
+        if ($currentHash -and (Test-Path -LiteralPath $AuthPath) -and
+            (Get-FileHash -LiteralPath $AuthPath -Algorithm SHA256).Hash -eq $currentHash -and
+            (Test-SameAuthIdentity $AuthPath $source)) {
+            Copy-Item -LiteralPath $source -Destination "$AuthPath.switching" -Force
+            Move-Item -LiteralPath "$AuthPath.switching" -Destination $AuthPath -Force
+        }
+    }
+    Assert-CodexClientsStopped
     New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
     $temp = "$AuthPath.switching"
     Copy-Item -Force -LiteralPath $source -Destination $temp
@@ -348,12 +398,12 @@ function Switch-Profile([string]$ProfileName) {
     Write-Registry $registry
     Write-Host "Switched to: $ProfileName" -ForegroundColor Green
     Show-WhoAmI
-    Write-Host 'Reopen Codex Desktop and start a new CLI session to use the selected account.' -ForegroundColor Yellow
+    Write-Host 'Reopen Codex Desktop, CLI sessions, or your IDE to use the selected account.' -ForegroundColor Yellow
 }
 
 function Add-Account([string]$ProfileName) {
     Assert-ProfileName $ProfileName
-    Assert-CodexDesktopStopped
+    Assert-CodexClientsStopped
     Ensure-FileCredentialStore
     $registry = Read-Registry
     if (Test-Path -LiteralPath $AuthPath) {
@@ -447,11 +497,14 @@ function Show-Doctor {
     Write-Host "Credential store: $(if ($credentialMode) { $credentialMode } else { 'default/unspecified' })"
     Write-Host "Profile data:     $DataRoot"
     Write-Host "Registry:         $RegistryPath"
-    $desktopProcesses = @(Get-CodexDesktopProcesses)
-    Write-Host "Codex Desktop:    $(if ($desktopProcesses.Count) { 'RUNNING - exit completely before add/switch' } else { 'not running' })"
+    $clientProcesses = @(Get-CodexClientProcesses)
+    Write-Host "Codex clients:    $(if ($clientProcesses.Count) { 'RUNNING - close Desktop, CLI, and IDE sessions before save/add/switch' } else { 'not running' })"
+    if ($clientProcesses.Count) {
+        foreach ($client in $clientProcesses) { Write-Host "  $(Get-CodexClientDescription $client)" }
+    }
     $registry = Read-Registry
     if ($credentialMode -ne 'file') {
-        Write-Warning 'Reliable switching requires file-based credentials. Exit Codex Desktop and run: codexSwitch setup'
+        Write-Warning 'Reliable switching requires file-based credentials. Close all Codex clients and run: codexSwitch setup'
     }
     if ($registry.active -and (Test-Path -LiteralPath $AuthPath)) {
         $activePath = Get-ProfilePath ([string]$registry.active)
@@ -494,8 +547,8 @@ function Start-Menu {
                 '1' { Show-WhoAmI }
                 '2' { Rename-Profile (Read-Host 'Current name') (Read-Host 'New name') }
                 '3' { Show-List; if ((Read-Host 'Open the profile folder? (y/N)') -match '^[Yy]') { Start-Process explorer.exe $ProfilesDir } }
-                '4' { Show-List; if (Wait-CodexDesktopStopped) { Switch-Profile (Read-Host 'Profile name') } }
-                '5' { if (Wait-CodexDesktopStopped) { Add-Account (Read-Host 'New profile name') } }
+                '4' { Show-List; if (Wait-CodexClientsStopped) { Switch-Profile (Read-Host 'Profile name') } }
+                '5' { if (Wait-CodexClientsStopped) { Add-Account (Read-Host 'New profile name') } }
                 '6' {
                     Show-List
                     $profileName = Read-Host 'Profile name to delete'
@@ -505,7 +558,7 @@ function Start-Menu {
                         Write-Host 'Canceled.' -ForegroundColor Yellow
                     }
                 }
-                '7' { if (Wait-CodexDesktopStopped) { Register-CurrentInteractive } }
+                '7' { if (Wait-CodexClientsStopped) { Register-CurrentInteractive } }
                 '0' { return }
                 default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
             }

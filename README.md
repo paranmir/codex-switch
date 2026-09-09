@@ -14,7 +14,9 @@ A small Windows CLI for saving multiple Codex logins as named profiles and switc
 - Add accounts without calling `codex logout`, which could invalidate the profile just saved
 - Keep credentials outside the Git repository in a user-local data directory
 - Support custom `CODEX_HOME` and `CODEX_SWITCH_HOME` locations
-- Diagnose the Codex installation, paths, and login state
+- Diagnose the Codex installation, paths, login state, and running Desktop/CLI/IDE clients
+- Preserve refreshed credentials even when the recorded active profile is out of date
+- Refresh and validate saved logins through the installed Codex CLI before applying a switch
 
 ## Requirements
 
@@ -52,7 +54,7 @@ Add another account. A browser login will open; you do not need to locate or cop
 Switch whenever needed:
 
 ```powershell
-# First exit Codex Desktop completely, including its tray/background process.
+# First close Codex Desktop (including the tray), CLI sessions, and Codex in your IDE.
 .\codexSwitch.cmd switch work
 .\codexSwitch.cmd switch personal
 ```
@@ -63,7 +65,7 @@ Run without arguments for an interactive menu:
 .\codexSwitch.cmd
 ```
 
-After exiting Codex Desktop, choose **7. Register the currently signed-in account** to save its last active account without starting another browser login. The equivalent command is:
+After closing all Codex clients, choose **7. Register the currently signed-in account** to save its last active account without starting another browser login. The equivalent command is:
 
 ```powershell
 .\codexSwitch.cmd save <name>
@@ -87,6 +89,14 @@ After exiting Codex Desktop, choose **7. Register the currently signed-in accoun
 | `help` | Show command-line help |
 
 Names must be 1–40 characters, start with a letter or number, and contain only letters, numbers, `.`, `_`, or `-`.
+
+`list` marks the profile matching the current `auth.json` with `*`. `whoami` also uses the actual file and warns if the recorded active name is stale. These commands describe credentials on disk; an already-running Desktop, CLI, or IDE session can still hold an earlier login in memory.
+
+Before switching, the tool saves the current credentials to their matching profile, even if the recorded active name is different. An account that has no matching profile is preserved as `recovered-YYYYMMDD-HHMMSS`.
+
+The target login is then checked in an isolated temporary Codex home. The installed CLI refreshes it through `account/read` and, for ChatGPT accounts, verifies access through `account/rateLimits/read`. Only a successful check allows the target to become active. Switching therefore needs network access and a Codex CLI with these app-server methods. `codex login status` alone only reports cached login state and is not sufficient to validate a saved login.
+
+Refreshed credentials are saved back to the profile even if a later network check fails, because refresh tokens can rotate. The previously active account is retained on validation failure. If the target is already the current account, its refreshed credentials are also retained in the current auth file.
 
 ## How `add` works
 
@@ -177,12 +187,21 @@ codex login status
 ```
 
 - **`codex` not found:** install Codex CLI and open a new terminal.
-- **Switch not reflected:** exit Codex Desktop completely (including its tray/background process), run `switch` again, and then reopen the app. Codex Switch refuses to replace authentication while the desktop app is running because the app can restore its previous login during shutdown.
-- **Codex asks you to sign in after switching:** update Codex Switch, close Codex Desktop, and run `codexSwitch setup`. Profiles created by an older release may have been invalidated by its `codex logout` step; re-add that account once with `codexSwitch add <name>`, then switch again.
+- **Switch not reflected:** close Codex Desktop completely (including its tray/background process), exit every Codex CLI session, and close or disable the Codex extension in your IDE. Run `doctor` to inspect remaining executable names, PIDs, and parent processes, run `switch` again, and then reopen your clients. Existing processes can retain the old login and write it back to `auth.json`; Codex Switch refuses to replace credentials while any of these clients is running.
+- **Codex asks you to sign in after switching:** update Codex Switch, close all Codex clients, and run `codexSwitch setup`. Profiles created by an older release may have been invalidated by its `codex logout` step; re-add that account once with `codexSwitch add <name>`, then switch again.
+- **Saved login cannot be refreshed:** a revoked or invalid refresh token cannot be repaired by copying it. If you have already signed in to that account again in Codex, close all clients and run `codexSwitch save <name>` to update the profile; otherwise run `codexSwitch add <name>` once. Future switches validate and preserve the refreshed login. A connectivity or server error can also prevent validation; retry after connectivity is restored.
 - **Profiles show the same account:** run `doctor`. It reports profiles that contain the same account and detects when the current login differs from the recorded active profile. Re-add any profile that was already overwritten; lost credentials cannot be reconstructed from the duplicate file.
 - **A profile file was deleted manually:** the next `list`, menu refresh, or other command removes the missing entry from `profiles.json`. The interactive menu also provides **Delete a profile** so manual file deletion is normally unnecessary.
 - **Login interrupted:** run `add` again, or complete `codex login` and then run `save <name>`.
 - **Windows PowerShell shows garbled text:** install PowerShell 7 so `pwsh` is available.
+
+## Tests
+
+The regression suite uses temporary directories and fake credentials; it does not change your Codex accounts:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tests\codex-switch.tests.ps1
+```
 
 ## Before publishing or contributing
 

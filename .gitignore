@@ -1,5 +1,12 @@
 profiles/
 profiles.json
+auth.json
+*.auth.json
+auth-before-add-*.json
+auth-check-*/
+backups/
+config.toml.codex-switch.bak
+*.switching
 *.tmp
 .DS_Store
 Thumbs.db

@@ -1,3 +1,4 @@
+. (Join-Path $PSScriptRoot 'TestSupport.ps1')
 $ErrorActionPreference = 'Stop'
 
 $scriptPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'codex-switch.ps1'
@@ -87,6 +88,7 @@ if ($Action -eq 'logout') {
 }
 if ($Action -eq 'login') {
     if ($Subaction -eq 'status') { exit 0 }
+    if ($env:CODEX_TEST_LOGIN_FAILURE -eq '1') { exit 1 }
     Copy-Item -Force -LiteralPath $env:CODEX_TEST_LOGIN_AUTH -Destination $authPath
     exit 0
 }
@@ -103,9 +105,9 @@ exit 1
     $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $env:PATH
 
     Write-TestAuth 'account-a' 'a@example.test'
-    & $scriptPath save alpha *> $null
+    Invoke-TestCommand save alpha *> $null
     Write-TestAuth 'account-b' 'b@example.test'
-    & $scriptPath save beta *> $null
+    Invoke-TestCommand save beta *> $null
 
     $betaPath = Join-Path $env:CODEX_SWITCH_HOME 'profiles\beta.auth.json'
     $betaHash = (Get-FileHash -LiteralPath $betaPath -Algorithm SHA256).Hash
@@ -117,26 +119,26 @@ exit 1
     $freshAuth.tokens.refresh_token = 'newer-test-refresh-token'
     [IO.File]::WriteAllText($authPath, ($freshAuth | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
     $freshAlphaHash = (Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash
-    $whoami = (& $scriptPath whoami 3>&1 6>&1 | Out-String)
+    $whoami = (Invoke-TestCommand whoami 3>&1 6>&1 | Out-String)
     Assert-True ($whoami -match 'differs from saved active profile') 'whoami should report a registry/auth mismatch'
     Assert-True ($whoami -match 'Profile: alpha') 'whoami should identify the actual matching profile despite a stale registry'
-    $list = (& $scriptPath list 6>&1 | Out-String)
+    $list = (Invoke-TestCommand list 6>&1 | Out-String)
     Assert-True ($list -match '(?m)^\* alpha\s') 'list should mark the actual account as current'
     Assert-True ($list -notmatch '(?m)^\* beta\s') 'list must not mark the stale registry account as current'
 
-    $switchOutput = (& $scriptPath switch alpha 3>&1 | Out-String)
+    $switchOutput = (Invoke-TestCommand switch alpha 3>&1 | Out-String)
     Assert-True ($switchOutput -match 'was not written over') 'switch should warn instead of overwriting the recorded active profile'
     Assert-True (((Get-FileHash -LiteralPath $betaPath -Algorithm SHA256).Hash) -eq $betaHash) 'mismatched active profile must remain unchanged'
     Assert-True ((Get-Content -Raw -LiteralPath $authPath | ConvertFrom-Json).tokens.refresh_token -eq 'newer-test-refresh-token-rotated') 'switching to the current account must use the newly rotated credentials'
     Assert-True (((Get-FileHash -LiteralPath (Join-Path $env:CODEX_SWITCH_HOME 'profiles\alpha.auth.json') -Algorithm SHA256).Hash) -eq (Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash) 'matching profile should receive refreshed credentials even with a stale active name'
 
-    & $scriptPath save alpha-copy *> $null
-    $doctor = (& $scriptPath doctor 3>&1 | Out-String)
+    Invoke-TestCommand save alpha-copy *> $null
+    $doctor = (Invoke-TestCommand doctor 3>&1 | Out-String)
     Assert-True ($doctor -match 'same Codex account') 'doctor should report duplicate account profiles'
 
     # Adding from an account that already exists under any profile must reuse it,
     # even when the registry's active name is stale. It must not create recovered-*.
-    & $scriptPath add gamma *> $null
+    Invoke-TestCommand add gamma *> $null
     $codexCalls = @(Get-Content -LiteralPath $fakeCallLog)
     Assert-True (-not ($codexCalls -match '^logout(?:\s|$)')) 'add must not call codex logout and invalidate the profile it just saved'
     Assert-True ([bool]($codexCalls -match '^login(?:\s|$)')) 'add should start a new Codex login'
@@ -149,11 +151,11 @@ exit 1
     # Deleting a profile file in the data folder must update the registry on the next command.
     $alphaCopyPath = Join-Path $env:CODEX_SWITCH_HOME 'profiles\alpha-copy.auth.json'
     Remove-Item -LiteralPath $alphaCopyPath
-    & $scriptPath list *> $null
+    Invoke-TestCommand list *> $null
     $registry = Get-Content -Raw -LiteralPath (Join-Path $env:CODEX_SWITCH_HOME 'profiles.json') | ConvertFrom-Json
     Assert-True (-not $registry.profiles.PSObject.Properties['alpha-copy']) 'manual profile-file deletion should be reflected in the registry'
 
-    & $scriptPath delete beta *> $null
+    Invoke-TestCommand delete beta *> $null
     $registry = Get-Content -Raw -LiteralPath (Join-Path $env:CODEX_SWITCH_HOME 'profiles.json') | ConvertFrom-Json
     Assert-True (-not $registry.profiles.PSObject.Properties['beta']) 'delete alias should remove the profile from the registry'
     Assert-True (-not (Test-Path -LiteralPath $betaPath)) 'delete alias should remove the profile file'
@@ -161,16 +163,25 @@ exit 1
     # A login changed outside the switcher must be preserved before switching away.
     Write-TestAuth 'account-unsaved' 'unsaved@example.test'
     $unsavedHash = (Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash
-    & $scriptPath switch gamma *> $null
+    Invoke-TestCommand switch gamma *> $null
     $recovered = @(Get-ChildItem -LiteralPath (Join-Path $env:CODEX_SWITCH_HOME 'profiles') -Filter 'recovered-*.auth.json')
     Assert-True ($recovered.Count -eq 1) 'switch should preserve an otherwise unsaved login once'
     Assert-True (((Get-FileHash -LiteralPath $recovered[0].FullName -Algorithm SHA256).Hash) -eq $unsavedHash) 'recovery must retain the complete unsaved login'
+
+    # Failed registration restores the current auth through the repository.
+    $beforeFailedLogin = (Get-FileHash -LiteralPath $authPath).Hash
+    $env:CODEX_TEST_LOGIN_FAILURE = '1'
+    $failed = $false
+    try { Invoke-TestCommand add failed *> $null } catch { $failed = $_.Exception.Message -match 'login did not complete' }
+    $env:CODEX_TEST_LOGIN_FAILURE = $null
+    Assert-True $failed 'a failed browser login must report failure'
+    Assert-True ((Get-FileHash -LiteralPath $authPath).Hash -eq $beforeFailedLogin) 'failed registration must restore the previous account'
 
     # Config edits must replace ephemeral mode and respect TOML table boundaries.
     $configPath = Join-Path $env:CODEX_HOME 'config.toml'
     foreach ($mode in @('file','keyring','auto','ephemeral')) {
         [IO.File]::WriteAllText($configPath, "cli_auth_credentials_store = `"$mode`"`r`nmodel = `"test-model`"`r`n", [Text.UTF8Encoding]::new($false))
-        & $scriptPath setup *> $null
+        Invoke-TestCommand setup *> $null
         $config = Get-Content -Raw -LiteralPath $configPath
         Assert-True ([regex]::Matches($config, '(?m)^cli_auth_credentials_store\s*=').Count -eq 1) 'setup must not create duplicate root keys'
         Assert-True ($config -match '(?m)^cli_auth_credentials_store = "file"\r?$') 'setup should select file mode'
@@ -178,60 +189,61 @@ exit 1
     }
     $tableConfig = "[profiles.example]`r`ncli_auth_credentials_store = `"file`"`r`n"
     [IO.File]::WriteAllText($configPath, $tableConfig, [Text.UTF8Encoding]::new($false))
-    & $scriptPath setup *> $null
+    Invoke-TestCommand setup *> $null
     $config = Get-Content -Raw -LiteralPath $configPath
     Assert-True ($config.StartsWith('cli_auth_credentials_store = "file"')) 'a table-local setting must not prevent adding a root setting'
     Assert-True ($config.EndsWith($tableConfig)) 'setup must preserve existing TOML tables'
 
     # Exercise switch's guard with Desktop absent and a CLI or IDE server present.
-    . $scriptPath help *> $null
+    $context = New-TestContext
 
     # Expired/revoked logins must fail before changing the active account.
-    $invalidPath = Get-ProfilePath 'invalid'
+    $invalidPath = Get-ProfilePath -Context $context 'invalid'
     $invalidAuth = New-TestAuth 'account-invalid' 'invalid@example.test' | ConvertFrom-Json
     $invalidAuth.tokens.refresh_token = 'invalid-test-token'
     Write-Utf8NoBom $invalidPath ($invalidAuth | ConvertTo-Json -Depth 4)
-    $null = Read-Registry
+    $null = Read-Registry -Context $context
     $beforeInvalid = (Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash
     $failed = $false
-    try { Switch-Profile 'invalid' *> $null } catch { $failed = $_.Exception.Message -match 'saved login could not be refreshed' }
+    try { Switch-Profile -Context $context 'invalid' *> $null } catch { $failed = $_.Exception.Message -match 'saved login could not be refreshed' }
     Assert-True $failed 'invalid refresh tokens must not be reported as successful switches'
-    Assert-True ((Read-Registry).active -eq 'gamma') 'invalid target must not become active'
+    Assert-True ((Read-Registry -Context $context).active -eq 'gamma') 'invalid target must not become active'
     Assert-True ((Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash -eq $beforeInvalid) 'invalid target must not replace the working login'
 
     # If validation fails after rotation, keep the rotated profile for a retry.
     $env:CODEX_TEST_NETWORK_FAILURE = '1'
-    $alphaPath = Get-ProfilePath 'alpha'
+    $alphaPath = Get-ProfilePath -Context $context 'alpha'
     $beforeRotation = (Get-Content -Raw -LiteralPath $alphaPath | ConvertFrom-Json).tokens.refresh_token
     $failed = $false
-    try { Switch-Profile 'alpha' *> $null } catch {
+    try { Switch-Profile -Context $context 'alpha' *> $null } catch {
         $failed = $_.Exception.Message -match 'RPC code'
         Assert-True ($_.Exception.Message -notmatch 'secret-token') 'upstream response bodies must not leak into errors'
     }
     Assert-True $failed 'network failures must not be reported as successful switches'
     Assert-True ((Get-Content -Raw -LiteralPath $alphaPath | ConvertFrom-Json).tokens.refresh_token -eq ($beforeRotation + '-rotated')) 'rotated profile credentials must survive a later network failure'
     Assert-True ((Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash -eq $beforeInvalid) 'network failure must leave another active account intact'
-    try { Switch-Profile 'gamma' *> $null } catch { }
-    Assert-True ((Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath (Get-ProfilePath 'gamma') -Algorithm SHA256).Hash) 'same-account rotation must also reach the live auth file on a later failure'
+    try { Switch-Profile -Context $context 'gamma' *> $null } catch { }
+    Assert-True ((Get-FileHash -LiteralPath $authPath -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath (Get-ProfilePath -Context $context 'gamma') -Algorithm SHA256).Hash) 'same-account rotation must also reach the live auth file on a later failure'
     $env:CODEX_TEST_NETWORK_FAILURE = $null
-    Switch-Profile 'alpha' *> $null
-    Switch-Profile 'gamma' *> $null
-    Assert-True ((Read-Registry).active -eq 'gamma') 'a round trip must work using the updated credentials'
-    Assert-True (@(Get-ChildItem -LiteralPath $DataRoot -Directory -Filter 'auth-check-*').Count -eq 0) 'completed checks must clean up their isolated homes'
+    Switch-Profile -Context $context 'alpha' *> $null
+    Switch-Profile -Context $context 'gamma' *> $null
+    Assert-True ((Read-Registry -Context $context).active -eq 'gamma') 'a round trip must work using the updated credentials'
+    Assert-True (@(Get-ChildItem -LiteralPath $context.DataRoot -Directory -Filter 'auth-check-*').Count -eq 0) 'completed checks must clean up their isolated homes'
 
     $env:CODEX_SWITCH_TEST_SKIP_APP_CHECK = $null
+    $context.SkipClientCheck = $false
     function Get-CimInstance {
         param([string]$ClassName, [string[]]$Property, [string]$ErrorAction)
         return $script:mockProcesses
     }
-    $protectedPaths = @($authPath, $configPath, $RegistryPath, (Get-ProfilePath 'gamma'))
+    $protectedPaths = @($authPath, $configPath, $context.RegistryPath, (Get-ProfilePath -Context $context 'gamma'))
     $beforeGuard = @($protectedPaths | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
     $parentProcess = [pscustomobject]@{ ProcessId=54321; ParentProcessId=0; Name='EditorHost.exe'; ExecutablePath='C:\AnyEditor\EditorHost.exe'; CreationDate=[datetime]'2026-01-01' }
     foreach ($clientPath in @('C:\Tools\Codex\codex.exe', 'C:\AnyEditor\extensions\codex.exe', 'C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe')) {
         $childProcess = [pscustomobject]@{ ProcessId=12345; ParentProcessId=54321; Name=[IO.Path]::GetFileName($clientPath); ExecutablePath=$clientPath; CreationDate=[datetime]'2026-01-02' }
         $script:mockProcesses = @($parentProcess, $childProcess)
         $blocked = $false
-        try { Switch-Profile 'gamma' *> $null } catch {
+        try { Switch-Profile -Context $context 'gamma' *> $null } catch {
             $blocked = $_.Exception.Message -match 'Codex clients are still running'
             Assert-True ($_.Exception.Message.Contains($clientPath)) 'the error should identify the remaining client executable'
             Assert-True ($_.Exception.Message -match 'parent: EditorHost.exe \(PID: 54321\)') 'the error should identify the actual parent without relying on editor-specific paths'
@@ -241,15 +253,15 @@ exit 1
     $afterGuard = @($protectedPaths | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
     Assert-True (($beforeGuard -join ',') -eq ($afterGuard -join ',')) 'blocked switches must not modify credentials, profiles, registry, or config'
     $parentProcess.CreationDate = [datetime]'2026-01-03'
-    $description = Get-CodexClientDescription @(Get-CodexClientProcesses)[0]
+    $description = Get-CodexClientDescription @(Get-CodexClientProcesses -Context $context)[0]
     Assert-True ($description -notmatch 'EditorHost.exe') 'a reused parent PID must not identify an unrelated process as the owner'
     $script:mockProcesses = @($childProcess)
-    $description = Get-CodexClientDescription @(Get-CodexClientProcesses)[0]
+    $description = Get-CodexClientDescription @(Get-CodexClientProcesses -Context $context)[0]
     Assert-True ($description -match 'parent PID: 54321 \(exited or unavailable\)') 'a remaining client should still be reported when its parent has exited'
     $script:mockProcesses = @($parentProcess)
-    Assert-CodexClientsStopped
+    Assert-CodexClientsStopped -Context $context
     $script:mockProcesses = @()
-    Assert-CodexClientsStopped
+    Assert-CodexClientsStopped -Context $context
     Remove-Item -LiteralPath 'Function:\Get-CimInstance'
 
     Write-Host 'All Codex Switch tests passed.' -ForegroundColor Green
@@ -261,6 +273,7 @@ exit 1
     $env:CODEX_TEST_CALL_LOG = $null
     $env:CODEX_TEST_NETWORK_FAILURE = $null
     $env:CODEX_HOME = $null
+    $env:CODEX_TEST_LOGIN_FAILURE = $null
     $env:CODEX_SWITCH_HOME = $null
     $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
     $resolvedTempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

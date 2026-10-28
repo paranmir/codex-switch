@@ -1,5 +1,68 @@
-# Validate through the installed Codex protocol, so Codex owns OAuth and refresh.
-# Tokens travel only through local files/pipes and are never printed.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'ProfileStore.psm1') -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'ProcessAnalysis.psm1') -DisableNameChecking
+
+function Get-CodexExecutable {
+    $cli = Get-Command codex -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cli) { return $cli.Source }
+    return $null
+}
+
+function Invoke-CodexLogin($Context, [switch]$StatusOnly) {
+    $cli = Get-Command codex -CommandType Application,ExternalScript -ErrorAction Stop | Select-Object -First 1
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.WorkingDirectory = if (Test-Path -LiteralPath $Context.CodexHome -PathType Container) { $Context.CodexHome } else { $Context.ScriptRoot }
+    $info.EnvironmentVariables['CODEX_HOME'] = $Context.CodexHome
+    $info.EnvironmentVariables.Remove('OPENAI_API_KEY')
+    $info.EnvironmentVariables.Remove('CODEX_API_KEY')
+    if ([IO.Path]::GetExtension($cli.Source) -ieq '.exe') {
+        $info.FileName = $cli.Source
+        $info.Arguments = if ($StatusOnly) { 'login status' } else { 'login -c cli_auth_credentials_store=\"file\"' }
+    } else {
+        $info.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $info.EnvironmentVariables['CODEX_SWITCH_CLI'] = $cli.Source
+        $launcher = if ($StatusOnly) { '& $env:CODEX_SWITCH_CLI login status; exit $LASTEXITCODE' } else { '& $env:CODEX_SWITCH_CLI login -c ''cli_auth_credentials_store="file"''; exit $LASTEXITCODE' }
+        $info.Arguments = '-NoLogo -NoProfile -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $info
+    try {
+        $null = $process.Start()
+        $process.WaitForExit()
+        if (-not $StatusOnly -and ($process.ExitCode -ne 0 -or -not (Test-CurrentAuth $Context))) { throw 'Codex login did not complete.' }
+    } finally { $process.Dispose() }
+}
+
+function Get-SwitchProcessSnapshot([object]$Context) {
+    return @(& $Context.ReadProcesses)
+}
+
+function Get-CodexClientProcesses([object]$Context) {
+    if ($Context.SkipClientCheck) { return @() }
+    return @(Get-CodexProcessInventory @(Get-SwitchProcessSnapshot -Context $Context))
+}
+
+function Get-CodexClientDescription([object]$Client) {
+    $description = "$($Client.ProcessName) (PID: $($Client.Id))"
+    if ($Client.ParentName) {
+        $description += "; parent: $($Client.ParentName) (PID: $($Client.ParentId))"
+    } elseif ($Client.ParentId) {
+        $description += "; parent PID: $($Client.ParentId) (exited or unavailable)"
+    }
+    if ($Client.Path) { $description += " - $($Client.Path)" }
+    return $description
+}
+
+function Assert-CodexClientsStopped([object]$Context) {
+    $running = @(Get-CodexClientProcesses -Context $Context)
+    if ($running.Count -eq 0) { return }
+    $details = ($running | Sort-Object Id | ForEach-Object { Get-CodexClientDescription $_ }) -join "`n  "
+    throw "Codex clients are still running:`n  $details`nClose the listed apps or their Codex extension completely, then retry. Existing processes can keep the old login and write it back to auth.json."
+}
+
 function Invoke-CodexAuthRequest($Process, [int]$Id, [string]$Method, $Params) {
     $Process.StandardInput.WriteLine((@{ id=$Id; method=$Method; params=$Params } | ConvertTo-Json -Depth 6 -Compress))
     $deadline = [datetime]::UtcNow.AddSeconds(30)
@@ -18,9 +81,9 @@ function Invoke-CodexAuthRequest($Process, [int]$Id, [string]$Method, $Params) {
     }
 }
 
-function Confirm-CodexProfileAuth([string]$ProfilePath, [bool]$RefreshToken = $true) {
+function Confirm-CodexProfileAuth([object]$Context, [string]$ProfilePath, [bool]$RefreshToken = $true) {
     $cli = Get-Command codex -CommandType Application,ExternalScript -ErrorAction Stop | Select-Object -First 1
-    $stage = Join-Path $DataRoot ('auth-check-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $($Context.DataRoot) ('auth-check-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stage | Out-Null
     $stagedAuth = Join-Path $stage 'auth.json'
     Copy-Item -LiteralPath $ProfilePath -Destination $stagedAuth
@@ -77,7 +140,7 @@ function Confirm-CodexProfileAuth([string]$ProfilePath, [bool]$RefreshToken = $t
         }
         if ($preserved) {
             $resolvedStage = [IO.Path]::GetFullPath($stage)
-            $resolvedRoot = [IO.Path]::GetFullPath($DataRoot).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+            $resolvedRoot = [IO.Path]::GetFullPath($($Context.DataRoot)).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
             if ($resolvedStage.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase) -and
                 [IO.Path]::GetFileName($resolvedStage) -like 'auth-check-*') {
                 Remove-Item -LiteralPath $resolvedStage -Recurse -Force
@@ -87,3 +150,5 @@ function Confirm-CodexProfileAuth([string]$ProfilePath, [bool]$RefreshToken = $t
         }
     }
 }
+
+Export-ModuleMember -Function Get-CodexExecutable, Invoke-CodexLogin, Get-SwitchProcessSnapshot, Get-CodexClientProcesses, Get-CodexClientDescription, Assert-CodexClientsStopped, Invoke-CodexAuthRequest, Confirm-CodexProfileAuth
